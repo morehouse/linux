@@ -1036,7 +1036,7 @@ static int tagged_addr_ctrl_get(struct task_struct *target,
 				const struct user_regset *regset,
 				struct membuf to)
 {
-	long ctrl = get_tagged_addr_ctrl(target);
+	long ctrl = get_tagged_addr_ctrl(target, NULL, NULL);
 
 	if (IS_ERR_VALUE(ctrl))
 		return ctrl;
@@ -1056,7 +1056,7 @@ static int tagged_addr_ctrl_set(struct task_struct *target, const struct
 	if (ret)
 		return ret;
 
-	return set_tagged_addr_ctrl(target, ctrl);
+	return set_tagged_addr_ctrl(target, ctrl, NULL, NULL);
 }
 #endif
 

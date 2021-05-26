@@ -56,6 +56,25 @@ static inline void clear_page(void *page)
 
 void copy_page(void *to, void *from);
 
+#define __untagged_addr(addr, n)	\
+	((__force __typeof__(addr))sign_extend64((__force u64)(addr), n))
+
+#define untagged_addr(addr)	({					\
+	u64 __addr = (__force u64)(addr);				\
+	if (__addr >> 63 == 0) {					\
+		if (test_thread_flag(TIF_LAM_U57))			\
+			__addr &= __untagged_addr(__addr, 56);		\
+		else if (test_thread_flag(TIF_LAM_U48))			\
+			__addr &= __untagged_addr(__addr, 47);		\
+	}								\
+	(__force __typeof__(addr))__addr;				\
+})
+
+#define untagged_ptr(ptr)	({					\
+	u64 __ptrval = (__force u64)(ptr);				\
+	__ptrval = untagged_addr(__ptrval);				\
+	(__force __typeof__(*(ptr)) *)__ptrval;				\
+})
 #endif	/* !__ASSEMBLY__ */
 
 #ifdef CONFIG_X86_VSYSCALL_EMULATION

@@ -220,4 +220,17 @@ unsigned long __get_current_cr3_fast(void);
 
 #include <asm-generic/mmu_context.h>
 
+#ifdef CONFIG_X86_5LEVEL
+static inline bool full_va_allowed(struct mm_struct *mm)
+{
+	/* LAM_U48 steals VA bits abouve 47-bit for tags */
+	return mm->context.lam != LAM_U48;
+}
+#else
+static inline bool full_va_allowed(struct mm_struct *mm)
+{
+	return false;
+}
+#endif
+
 #endif /* _ASM_X86_MMU_CONTEXT_H */

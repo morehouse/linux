@@ -835,3 +835,148 @@ unsigned long KSTK_ESP(struct task_struct *task)
 {
 	return task_pt_regs(task)->sp;
 }
+
+/*
+ * Control the relaxed ABI allowing tagged user addresses into the kernel.
+ */
+static unsigned int tagged_addr_disabled;
+
+static bool lam_u48_allowed(void)
+{
+	struct mm_struct *mm = current->mm;
+
+	if (!full_va_allowed(mm))
+		return true;
+
+	return find_vma(mm, DEFAULT_MAP_WINDOW) == NULL;
+}
+
+#define LAM_U48_BITS 15
+#define LAM_U57_BITS 6
+
+long set_tagged_addr_ctrl(unsigned long flags,
+			  int __user *nr_bits, int __user *offset)
+{
+	int val;
+
+	if (in_32bit_syscall())
+		return -EINVAL;
+	if (flags & ~PR_TAGGED_ADDR_ENABLE)
+		return -EINVAL;
+	if (!boot_cpu_has(X86_FEATURE_LAM))
+		return -ENOTSUPP;
+
+	/* Disable LAM */
+	if (!(flags & PR_TAGGED_ADDR_ENABLE)) {
+		clear_thread_flag(TIF_LAM_U48);
+		clear_thread_flag(TIF_LAM_U57);
+
+		/* Update CR3 */
+		switch_mm(current->mm, current->mm, current);
+
+		return 0;
+	}
+
+	/*
+	 * nr_bits == NULL || offset == NULL assumes ARM TBI (nr_bits == 8,
+	 * offset == 56). LAM cannot provide this.
+	 */
+	if (!nr_bits || !offset)
+		return -EINVAL;
+
+	/*
+	 * Do not allow the enabling of the tagged address ABI if globally
+	 * disabled via sysctl abi.tagged_addr_disabled.
+	 */
+	if (tagged_addr_disabled)
+		return -EINVAL;
+
+	if (get_user(val, nr_bits))
+		return -EFAULT;
+	if (val > LAM_U48_BITS || val < 1)
+		return -EINVAL;
+	if (val > LAM_U57_BITS && !lam_u48_allowed())
+		return -EINVAL;
+
+	val = val > LAM_U57_BITS ? LAM_U48_BITS : LAM_U57_BITS;
+	if (put_user(val, nr_bits) || put_user(63 - val, offset))
+		return -EFAULT;
+
+	if (val == LAM_U57_BITS) {
+		clear_thread_flag(TIF_LAM_U48);
+		set_thread_flag(TIF_LAM_U57);
+		if (current->mm->context.lam == LAM_NONE)
+			current->mm->context.lam = LAM_U57;
+	} else {
+		clear_thread_flag(TIF_LAM_U57);
+		set_thread_flag(TIF_LAM_U48);
+
+		/*
+		 * Do not allow to create a mapping above 47 bit.
+		 *
+		 * It's one way road: once a thread of the process enabled
+		 * LAM_U48, no thread can ever create mapping above 47 bit.
+		 * Even the LAM got disabled later.
+		 */
+		current->mm->context.lam = LAM_U48;
+	}
+
+	/* Update CR3 */
+	switch_mm(current->mm, current->mm, current);
+
+	return 0;
+}
+
+long get_tagged_addr_ctrl(int __user *nr_bits, int __user *offset)
+{
+	if (in_32bit_syscall())
+		return -EINVAL;
+
+	if (test_thread_flag(TIF_LAM_U57)) {
+		if (nr_bits && put_user(LAM_U57_BITS, nr_bits))
+			return -EFAULT;
+		if (offset && put_user(63 - LAM_U57_BITS, offset))
+			return -EFAULT;
+	} else if (test_thread_flag(TIF_LAM_U48)) {
+		if (nr_bits && put_user(LAM_U48_BITS, nr_bits))
+			return -EFAULT;
+		if (offset && put_user(63 - LAM_U48_BITS, offset))
+			return -EFAULT;
+	} else {
+		int max_bits = lam_u48_allowed() ? LAM_U48_BITS : LAM_U57_BITS;
+
+		/* Report maximum tag size */
+		if (nr_bits && put_user(max_bits, nr_bits))
+		    return -EFAULT;
+		return 0;
+	}
+
+	return PR_TAGGED_ADDR_ENABLE;
+}
+
+/*
+ * Global sysctl to disable the tagged user addresses support. This control
+ * only prevents the tagged address ABI enabling via prctl() and does not
+ * disable it for tasks that already opted in to the relaxed ABI.
+ */
+
+static struct ctl_table tagged_addr_sysctl_table[] = {
+	{
+		.procname	= "tagged_addr_disabled",
+		.mode		= 0644,
+		.data		= &tagged_addr_disabled,
+		.maxlen		= sizeof(int),
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{ }
+};
+
+static int __init tagged_addr_init(void)
+{
+	if (!register_sysctl("abi", tagged_addr_sysctl_table))
+		return -EINVAL;
+	return 0;
+}
+core_initcall(tagged_addr_init);

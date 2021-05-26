@@ -800,6 +800,16 @@ extern void start_thread(struct pt_regs *regs, unsigned long new_ip,
 extern int get_tsc_mode(unsigned long adr);
 extern int set_tsc_mode(unsigned int val);
 
+#ifdef CONFIG_X86_64
+long set_tagged_addr_ctrl(unsigned long flags,
+			  int __user *nr_bits, int __user *offset);
+long get_tagged_addr_ctrl(int __user *nr_bits, int __user *offset);
+#define SET_TAGGED_ADDR_CTRL(flags, nr_bits, offset)	\
+	set_tagged_addr_ctrl(flags, nr_bits, offset)
+#define GET_TAGGED_ADDR_CTRL(nr_bits, offset)		\
+	get_tagged_addr_ctrl(nr_bits, offset)
+#endif
+
 DECLARE_PER_CPU(u64, msr_misc_features_shadow);
 
 #ifdef CONFIG_CPU_SUP_AMD

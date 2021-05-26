@@ -40,6 +40,7 @@ typedef struct {
 
 #ifdef CONFIG_X86_64
 	unsigned short flags;
+        u8 lam;
 #endif
 
 	struct mutex lock;

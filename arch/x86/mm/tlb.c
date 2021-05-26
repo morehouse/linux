@@ -145,17 +145,101 @@ static inline u16 user_pcid(u16 asid)
 	return ret;
 }
 
-static inline unsigned long build_cr3(pgd_t *pgd, u16 asid)
+#ifdef CONFIG_X86_64
+static inline unsigned long lam_to_cr3(u8 lam)
 {
-	if (static_cpu_has(X86_FEATURE_PCID)) {
-		return __sme_pa(pgd) | kern_pcid(asid);
-	} else {
-		VM_WARN_ON_ONCE(asid != 0);
-		return __sme_pa(pgd);
+	switch (lam) {
+	case LAM_NONE:
+		return 0;
+	case LAM_U57:
+		return X86_CR3_LAM_U57;
+	case LAM_U48:
+		return X86_CR3_LAM_U48;
+	default:
+		WARN_ON_ONCE(1);
+		return 0;
 	}
 }
 
-static inline unsigned long build_cr3_noflush(pgd_t *pgd, u16 asid)
+static inline u8 cr3_to_lam(unsigned long cr3)
+{
+	if (cr3 & X86_CR3_LAM_U57)
+		return LAM_U57;
+	if (cr3 & X86_CR3_LAM_U48)
+		return LAM_U48;
+	return 0;
+}
+
+static u8 gen_lam(struct task_struct *tsk, struct mm_struct *mm)
+{
+	struct thread_info *ti = task_thread_info(tsk);
+	if (!tsk)
+		return LAM_NONE;
+
+	if (tsk->flags & PF_KTHREAD) {
+		/*
+		 * For kernel thread use the most permissive LAM
+		 * used by the mm. It's required to handle kernel thread
+		 * memory accesses on behalf of a process.
+		 *
+		 * Adjust thread flags accodringly, so untagged_addr() would
+		 * work correctly.
+		 */
+		switch (mm->context.lam) {
+		case LAM_NONE:
+			clear_thread_flag(TIF_LAM_U48);
+			clear_thread_flag(TIF_LAM_U57);
+			return LAM_NONE;
+		case LAM_U57:
+			clear_thread_flag(TIF_LAM_U48);
+			set_thread_flag(TIF_LAM_U57);
+			return LAM_U57;
+		case LAM_U48:
+			set_thread_flag(TIF_LAM_U48);
+			clear_thread_flag(TIF_LAM_U57);
+			return LAM_U48;
+		default:
+			WARN_ON_ONCE(1);
+			return LAM_NONE;
+		}
+	}
+
+	if (test_ti_thread_flag(ti, TIF_LAM_U57))
+		return LAM_U57;
+	if (test_ti_thread_flag(ti, TIF_LAM_U48))
+		return LAM_U48;
+	return LAM_NONE;
+}
+
+#else
+
+static inline unsigned long lam_to_cr3(u8 lam)
+{
+	return 0;
+}
+
+static inline u8 cr3_to_lam(unsigned long cr3)
+{
+	return LAM_NONE;
+}
+
+static u8 gen_lam(struct task_struct *tsk, struct mm_struct *mm)
+{
+	return LAM_NONE;
+}
+#endif
+
+static inline unsigned long build_cr3(pgd_t *pgd, u16 asid, u8 lam)
+{
+	if (static_cpu_has(X86_FEATURE_PCID)) {
+		return __sme_pa(pgd) | kern_pcid(asid) | lam_to_cr3(lam);
+	} else {
+		VM_WARN_ON_ONCE(asid != 0);
+		return __sme_pa(pgd) | lam_to_cr3(lam);
+	}
+}
+
+static inline unsigned long build_cr3_noflush(pgd_t *pgd, u16 asid, u8 lam)
 {
 	VM_WARN_ON_ONCE(asid > MAX_ASID_AVAILABLE);
 	/*
@@ -164,7 +248,7 @@ static inline unsigned long build_cr3_noflush(pgd_t *pgd, u16 asid)
 	 * boot because all CPU's the have same capabilities:
 	 */
 	VM_WARN_ON_ONCE(!boot_cpu_has(X86_FEATURE_PCID));
-	return __sme_pa(pgd) | kern_pcid(asid) | CR3_NOFLUSH;
+	return __sme_pa(pgd) | kern_pcid(asid) | CR3_NOFLUSH | lam_to_cr3(lam);
 }
 
 /*
@@ -265,15 +349,15 @@ static inline void invalidate_user_asid(u16 asid)
 		  (unsigned long *)this_cpu_ptr(&cpu_tlbstate.user_pcid_flush_mask));
 }
 
-static void load_new_mm_cr3(pgd_t *pgdir, u16 new_asid, bool need_flush)
+static void load_new_mm_cr3(pgd_t *pgdir, u16 new_asid, u8 lam, bool need_flush)
 {
 	unsigned long new_mm_cr3;
 
 	if (need_flush) {
 		invalidate_user_asid(new_asid);
-		new_mm_cr3 = build_cr3(pgdir, new_asid);
+		new_mm_cr3 = build_cr3(pgdir, new_asid, lam);
 	} else {
-		new_mm_cr3 = build_cr3_noflush(pgdir, new_asid);
+		new_mm_cr3 = build_cr3_noflush(pgdir, new_asid, lam);
 	}
 
 	/*
@@ -424,6 +508,8 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 {
 	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
 	u16 prev_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
+	u8 prev_lam = this_cpu_read(cpu_tlbstate.lam);
+	u8 new_lam = gen_lam(tsk, next);
 	bool was_lazy = this_cpu_read(cpu_tlbstate.is_lazy);
 	unsigned cpu = smp_processor_id();
 	u64 next_tlb_gen;
@@ -437,6 +523,9 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	 * cpu_tlbstate.loaded_mm) matches next.
 	 *
 	 * NB: leave_mm() calls us with prev == NULL and tsk == NULL.
+	 *
+	 * NB: Initial LAM enabling calls us with prev == next. We must update
+	 * CR3 if prev_lam doesn't match the new one.
 	 */
 
 	/* We don't want flush_tlb_func_* to run concurrently with us. */
@@ -453,7 +542,8 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	 * isn't free.
 	 */
 #ifdef CONFIG_DEBUG_VM
-	if (WARN_ON_ONCE(__read_cr3() != build_cr3(real_prev->pgd, prev_asid))) {
+	if (WARN_ON_ONCE(__read_cr3() !=
+			 build_cr3(real_prev->pgd, prev_asid, prev_lam))) {
 		/*
 		 * If we were to BUG here, we'd be very likely to kill
 		 * the system so hard that we don't see the call trace.
@@ -483,7 +573,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	 * provides that full memory barrier and core serializing
 	 * instruction.
 	 */
-	if (real_prev == next) {
+	if (real_prev == next && prev_lam == new_lam) {
 		VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[prev_asid].ctx_id) !=
 			   next->context.ctx_id);
 
@@ -555,15 +645,16 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		barrier();
 	}
 
+	this_cpu_write(cpu_tlbstate.lam, new_lam);
 	if (need_flush) {
 		this_cpu_write(cpu_tlbstate.ctxs[new_asid].ctx_id, next->context.ctx_id);
 		this_cpu_write(cpu_tlbstate.ctxs[new_asid].tlb_gen, next_tlb_gen);
-		load_new_mm_cr3(next->pgd, new_asid, true);
+		load_new_mm_cr3(next->pgd, new_asid, new_lam, true);
 
 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
 	} else {
 		/* The new ASID is already up to date. */
-		load_new_mm_cr3(next->pgd, new_asid, false);
+		load_new_mm_cr3(next->pgd, new_asid, new_lam, false);
 
 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, 0);
 	}
@@ -620,6 +711,7 @@ void initialize_tlbstate_and_flush(void)
 	struct mm_struct *mm = this_cpu_read(cpu_tlbstate.loaded_mm);
 	u64 tlb_gen = atomic64_read(&init_mm.context.tlb_gen);
 	unsigned long cr3 = __read_cr3();
+	u8 lam = cr3_to_lam(cr3);
 
 	/* Assert that CR3 already references the right mm. */
 	WARN_ON((cr3 & CR3_ADDR_MASK) != __pa(mm->pgd));
@@ -633,7 +725,7 @@ void initialize_tlbstate_and_flush(void)
 		!(cr4_read_shadow() & X86_CR4_PCIDE));
 
 	/* Force ASID 0 and force a TLB flush. */
-	write_cr3(build_cr3(mm->pgd, 0));
+	write_cr3(build_cr3(mm->pgd, 0, lam));
 
 	/* Reinitialize tlbstate. */
 	this_cpu_write(cpu_tlbstate.last_user_mm_ibpb, LAST_USER_MM_IBPB);
@@ -970,8 +1062,10 @@ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
  */
 unsigned long __get_current_cr3_fast(void)
 {
-	unsigned long cr3 = build_cr3(this_cpu_read(cpu_tlbstate.loaded_mm)->pgd,
-		this_cpu_read(cpu_tlbstate.loaded_mm_asid));
+	unsigned long cr3 =
+		build_cr3(this_cpu_read(cpu_tlbstate.loaded_mm)->pgd,
+		this_cpu_read(cpu_tlbstate.loaded_mm_asid),
+		this_cpu_read(cpu_tlbstate.lam));
 
 	/* For now, be very restrictive about when this can be called. */
 	VM_WARN_ON(in_nmi() || preemptible());

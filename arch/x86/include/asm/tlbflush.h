@@ -17,6 +17,10 @@ void __flush_tlb_all(void);
 
 #define TLB_FLUSH_ALL	-1UL
 
+#define LAM_NONE	0
+#define LAM_U57		1
+#define LAM_U48		2
+
 void cr4_update_irqsoff(unsigned long set, unsigned long clear);
 unsigned long cr4_read_shadow(void);
 
@@ -88,6 +92,7 @@ struct tlb_state {
 
 	u16 loaded_mm_asid;
 	u16 next_asid;
+	u8 lam;
 
 	/*
 	 * We can be in one of several states:

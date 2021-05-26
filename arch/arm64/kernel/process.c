@@ -619,15 +619,21 @@ void arch_setup_new_exec(void)
 }
 
 #ifdef CONFIG_ARM64_TAGGED_ADDR_ABI
+
+#define TBI_TAG_BITS	8
+#define TBI_TAG_SHIFT	56
+
 /*
  * Control the relaxed ABI allowing tagged user addresses into the kernel.
  */
 static unsigned int tagged_addr_disabled;
 
-long set_tagged_addr_ctrl(struct task_struct *task, unsigned long arg)
+long set_tagged_addr_ctrl(struct task_struct *task, unsigned long flags,
+			  int __user *nr_bits, int __user *offset)
 {
 	unsigned long valid_mask = PR_TAGGED_ADDR_ENABLE;
 	struct thread_info *ti = task_thread_info(task);
+	int val;
 
 	if (is_compat_thread(ti))
 		return -EINVAL;
@@ -635,25 +641,41 @@ long set_tagged_addr_ctrl(struct task_struct *task, unsigned long arg)
 	if (system_supports_mte())
 		valid_mask |= PR_MTE_TCF_MASK | PR_MTE_TAG_MASK;
 
-	if (arg & ~valid_mask)
+	if (flags & ~valid_mask)
 		return -EINVAL;
+
+	if (nr_bits) {
+		if (get_user(val, nr_bits))
+			return -EFAULT;
+		if (val > TBI_TAG_BITS || val < 1)
+			return -EINVAL;
+	}
 
 	/*
 	 * Do not allow the enabling of the tagged address ABI if globally
 	 * disabled via sysctl abi.tagged_addr_disabled.
 	 */
-	if (arg & PR_TAGGED_ADDR_ENABLE && tagged_addr_disabled)
+	if (flags & PR_TAGGED_ADDR_ENABLE && tagged_addr_disabled)
 		return -EINVAL;
 
-	if (set_mte_ctrl(task, arg) != 0)
+	if (set_mte_ctrl(task, flags) != 0)
 		return -EINVAL;
 
-	update_ti_thread_flag(ti, TIF_TAGGED_ADDR, arg & PR_TAGGED_ADDR_ENABLE);
+	if (flags & PR_TAGGED_ADDR_ENABLE) {
+		if (nr_bits && put_user(TBI_TAG_BITS, nr_bits))
+			return -EFAULT;
+		if (offset && put_user(TBI_TAG_SHIFT, offset))
+			return -EFAULT;
+	}
+
+	update_ti_thread_flag(ti, TIF_TAGGED_ADDR,
+			      flags & PR_TAGGED_ADDR_ENABLE);
 
 	return 0;
 }
 
-long get_tagged_addr_ctrl(struct task_struct *task)
+long get_tagged_addr_ctrl(struct task_struct *task,
+			  int __user *nr_bits, int __user *offset)
 {
 	long ret = 0;
 	struct thread_info *ti = task_thread_info(task);
@@ -661,8 +683,17 @@ long get_tagged_addr_ctrl(struct task_struct *task)
 	if (is_compat_thread(ti))
 		return -EINVAL;
 
-	if (test_ti_thread_flag(ti, TIF_TAGGED_ADDR))
+	if (test_ti_thread_flag(ti, TIF_TAGGED_ADDR)) {
 		ret = PR_TAGGED_ADDR_ENABLE;
+		if (nr_bits && put_user(TBI_TAG_BITS, nr_bits))
+			return -EFAULT;
+		if (offset && put_user(TBI_TAG_SHIFT, offset))
+			return -EFAULT;
+	} else {
+		/* Report maximum tag size */
+		if (nr_bits && put_user(TBI_TAG_BITS, nr_bits))
+		    return -EFAULT;
+	}
 
 	ret |= get_mte_ctrl(task);
 

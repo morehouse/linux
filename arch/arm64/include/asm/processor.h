@@ -305,10 +305,14 @@ extern void __init minsigstksz_setup(void);
 
 #ifdef CONFIG_ARM64_TAGGED_ADDR_ABI
 /* PR_{SET,GET}_TAGGED_ADDR_CTRL prctl */
-long set_tagged_addr_ctrl(struct task_struct *task, unsigned long arg);
-long get_tagged_addr_ctrl(struct task_struct *task);
-#define SET_TAGGED_ADDR_CTRL(arg)	set_tagged_addr_ctrl(current, arg)
-#define GET_TAGGED_ADDR_CTRL()		get_tagged_addr_ctrl(current)
+long set_tagged_addr_ctrl(struct task_struct *task, unsigned long flags,
+			  int __user *nr_bits, int __user *offset);
+long get_tagged_addr_ctrl(struct task_struct *task,
+			  int __user *nr_bits, int __user *offset);
+#define SET_TAGGED_ADDR_CTRL(flags, nr_bits, offset)	\
+	set_tagged_addr_ctrl(current, flags, nr_bits, offset)
+#define GET_TAGGED_ADDR_CTRL(nr_bits, offset)		\
+	get_tagged_addr_ctrl(current, nr_bits, offset)
 #endif
 
 /*
